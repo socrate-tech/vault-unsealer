@@ -3,13 +3,12 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"os"
-	"strings"
 
 	"github.com/bakito/vault-unsealer/controllers"
 	"github.com/bakito/vault-unsealer/pkg/cache"
 	"github.com/bakito/vault-unsealer/pkg/constants"
+	"github.com/bakito/vault-unsealer/pkg/hierarchy"
 	"github.com/bakito/vault-unsealer/pkg/logging"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -40,31 +39,23 @@ func init() {
 func main() {
 	var enableLeaderElection bool
 	var enableSharedCache bool
-	deploymentSelector := selector{}
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
 	flag.BoolVar(&enableSharedCache, "shared-cache", false, "Enable shared cache between the operator instances.")
-	flag.Var(&deploymentSelector, "deployment-selector", "Label selector to evaluate other pods of the same deployment")
 	opts := zap.Options{
 		Development: true,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
-	logging.PrepareLogger(true)
-	watchNamespace := os.Getenv(constants.EnvWatchNamespace)
-
-	defaultNamespaces := map[string]crtlcache.Config{
-		watchNamespace: {},
-	}
-	if watchNamespace == "" {
-		defaultNamespaces = nil
-	}
-
+	logging.SetupLogger(true)
+	podNamespace := os.Getenv(constants.EnvNamespace)
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
 		Cache: crtlcache.Options{
-			DefaultNamespaces: defaultNamespaces,
+			DefaultNamespaces: map[string]crtlcache.Config{
+				podNamespace: {},
+			},
 		},
 		Metrics: server.Options{
 			BindAddress: ":8080",
@@ -73,7 +64,7 @@ func main() {
 		HealthProbeBindAddress:  ":8081",
 		LeaderElection:          enableLeaderElection,
 		LeaderElectionID:        constants.OperatorID,
-		LeaderElectionNamespace: watchNamespace,
+		LeaderElectionNamespace: podNamespace,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -81,48 +72,53 @@ func main() {
 	}
 
 	ctx := context.TODO()
-
+	var c cache.Cache
 	if enableSharedCache {
-		if len(deploymentSelector) == 0 {
-			setupLog.Error(nil, "deployment selector is needed for shared cache")
+		k8sCache, err := cache.NewK8s(mgr.GetAPIReader())
+		if err != nil {
+			setupLog.Error(err, "unable to create cache")
 			os.Exit(1)
 		}
 
-		myIP, members, err := cache.FindMemberPodIPs(ctx, mgr, watchNamespace, deploymentSelector)
-		if err != nil {
-			setupLog.Error(err, "unable to find operator pods")
-			os.Exit(1)
-		}
-
-		c, err := cache.NewClustered(myIP, members)
-		if err != nil {
+		if err := k8sCache.SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to setup cache")
 			os.Exit(1)
 		}
-		go run(ctx, mgr, watchNamespace, c)
-
-		if err = c.Start(); err != nil {
-			setupLog.Error(err, "unable to start cache")
-			os.Exit(1)
-		}
+		c = k8sCache
 	} else {
-		run(ctx, mgr, watchNamespace, cache.NewSimple())
+		c = cache.NewSimple()
 	}
+	run(ctx, mgr, podNamespace, c)
 }
 
-func run(ctx context.Context, mgr manager.Manager, watchNamespace string, cache cache.Cache) {
+func run(ctx context.Context, mgr manager.Manager, podNamespace string, cache cache.Cache) {
 	secrets := &corev1.SecretList{}
 	if err := mgr.GetAPIReader().List(
 		ctx,
 		secrets,
 		client.HasLabels{constants.LabelStatefulSetName},
-		client.InNamespace(watchNamespace),
+		client.InNamespace(podNamespace),
 	); err != nil {
 		setupLog.Error(err, "unable to find secrets")
 		os.Exit(1)
 	}
 	setupLog.WithValues("secrets", len(secrets.Items)).Info("found unseal secrets")
 
+	sel, err := hierarchy.GetDeploymentSelector(ctx, mgr.GetAPIReader())
+	if err != nil {
+		setupLog.Error(err, "unable to find deployment of unsealer")
+		os.Exit(1)
+	}
+
+	if err := (&controllers.EndpintsReconciler{
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		Cache:            cache,
+		UnsealerSelector: sel,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "Endpoint")
+		os.Exit(1)
+	}
 	if err := (&controllers.PodReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -141,25 +137,9 @@ func run(ctx context.Context, mgr manager.Manager, watchNamespace string, cache 
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}
-
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
-}
-
-type selector map[string]string
-
-func (i selector) String() string {
-	return "selector labels"
-}
-
-func (i selector) Set(value string) error {
-	parts := strings.Split(value, ":")
-	if len(parts) > 2 {
-		return fmt.Errorf("invalid selector %q", value)
-	}
-	i[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-	return nil
 }
